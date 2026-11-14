@@ -31,6 +31,16 @@ _LOGGER = logging.getLogger(__name__)
 
 MIN_TIME_BETWEEN_UPDATES = timedelta(minutes=4)
 SCAN_INTERVAL = timedelta(minutes=5)
+# The update interval is set by the remaining API calls, down to this floor.
+MIN_UPDATE_INTERVAL = timedelta(minutes=1)
+
+# Every refresh fetches the state of all zones in a single call. The rest of the
+# data changes far less often, so it is fetched on slower schedules of its own:
+# devices (battery, connection, child lock), weather and the home state...
+HOME_DATA_INTERVAL = timedelta(minutes=15)
+HOME_DATA_CALLS = 3
+# ...and the account, zones, temperature offsets and zone default overlays.
+SETUP_DATA_INTERVAL = timedelta(hours=6)
 
 type TadoConfigEntry = ConfigEntry[TadoDataUpdateCoordinator]
 
@@ -83,6 +93,11 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._next_update: datetime | None = None
         self._time_until_reset: float = 0
 
+        self._home_data_updated: datetime | None = None
+        self._setup_data_updated: datetime | None = None
+        self._temp_offsets: dict[str, dict[str, Any]] = {}
+        self._overlay_defaults: dict[int, dict[str, Any]] = {}
+
     @property
     def fallback(self) -> str:
         """Return fallback flag to Smart Schedule."""
@@ -90,47 +105,39 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @override
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch the (initial) latest data from Tado."""
+        """Fetch the latest data from Tado.
 
-        def _load_tado_data() -> tuple[dict, list, list]:
-            """Load Tado data in one call."""
-            _LOGGER.debug("Preloading Tado data")
-            return (
-                self._tado.get_me(),
-                self._tado.get_zones(),
-                self._tado.get_devices(),
+        The zone states are fetched every time; the home and setup data only when
+        they are older than their own intervals.
+        """
+        now = dt_util.utcnow()
+        refresh_setup = (
+            self._setup_data_updated is None
+            or now - self._setup_data_updated >= SETUP_DATA_INTERVAL
+        )
+        refresh_home = (
+            refresh_setup
+            or self._home_data_updated is None
+            or now - self._home_data_updated >= HOME_DATA_INTERVAL
+        )
+
+        if refresh_setup:
+            await self._async_update_setup()
+
+        if refresh_home:
+            self.data["device"] = await self._async_update_devices(
+                refresh_offsets=refresh_setup
             )
+            home = await self._async_update_home()
+            self.data["weather"] = home["weather"]
+            self.data["geofence"] = home["geofence"]
+            self._home_data_updated = now
 
-        try:
-            (
-                tado_home_call,
-                self.zones,
-                self.devices,
-            ) = await self.hass.async_add_executor_job(_load_tado_data)
-        except RequestException as err:
-            _LOGGER.debug("Checking rate limit")
-            ratelimit = self.get_rate_limit()
-            if ratelimit.get("remaining") == "0":
-                raise UpdateFailed(f"Tado API rate limit reached: {err}") from err
-            raise UpdateFailed(f"Error during Tado setup: {err}") from err
-
-        tado_home = tado_home_call["homes"][0]
-        self.home_id = tado_home["id"]
-        self.home_name = tado_home["name"]
-
-        # Heating circuits are configuration, so fetching them once is enough.
-        if not self._heating_circuits_loaded:
-            await self._async_fetch_heating_circuits()
-            self._heating_circuits_loaded = True
-
-        devices = await self._async_update_devices()
-        zones = await self._async_update_zones()
-        home = await self._async_update_home()
-
-        self.data["device"] = devices
-        self.data["zone"] = zones
-        self.data["weather"] = home["weather"]
-        self.data["geofence"] = home["geofence"]
+        self.data["zone"] = await self._async_update_zones(
+            refresh_defaults=refresh_setup
+        )
+        if refresh_setup:
+            self._setup_data_updated = now
         self.data["rate_limit"] = self.get_rate_limit()
 
         refresh_token = await self.hass.async_add_executor_job(
@@ -150,17 +157,36 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return self.data
 
-    @property
-    def _is_any_zone_active(self) -> bool:
-        """Check if any zone is currently active (heating or AC running)."""
-        return any(
-            (
-                zone_data.heating_power_percentage is not None
-                and zone_data.heating_power_percentage > 0
+    async def _async_update_setup(self) -> None:
+        """Fetch the account and zones, which rarely change."""
+
+        def _load_setup_data() -> tuple[dict, list]:
+            _LOGGER.debug("Loading Tado setup data")
+            return self._tado.get_me(), self._tado.get_zones()
+
+        try:
+            tado_home_call, self.zones = await self.hass.async_add_executor_job(
+                _load_setup_data
             )
-            or zone_data.ac_power == "ON"
-            for zone_data in self.data.get("zone", {}).values()
-        )
+        except RequestException as err:
+            _LOGGER.debug("Checking rate limit")
+            ratelimit = self.get_rate_limit()
+            if ratelimit.get("remaining") == "0":
+                raise UpdateFailed(f"Tado API rate limit reached: {err}") from err
+            raise UpdateFailed(f"Error during Tado setup: {err}") from err
+
+        tado_home = tado_home_call["homes"][0]
+        self.home_id = tado_home["id"]
+        self.home_name = tado_home["name"]
+
+        # Heating circuits are configuration, so fetching them once is enough.
+        if not self._heating_circuits_loaded:
+            await self._async_fetch_heating_circuits()
+            self._heating_circuits_loaded = True
+
+    def _invalidate_home_data(self) -> None:
+        """Fetch the home data on the next refresh, after it was changed."""
+        self._home_data_updated = None
 
     def _calculate_update_interval(self) -> None:
         """Calculate an update interval based on remaining calls and estimates."""
@@ -181,12 +207,6 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._time_until_reset = (next_reset - reset_time).total_seconds()
 
-        # When any zone is actively heating, we use a shorter minimum
-        # To prevent overshooting in temperature,
-        # check if there's heating/cooling activity
-        # Accept five minutes to "overshoot", else reset back to 30 minutes
-        min_interval = 300 if self._is_any_zone_active else 1800
-
         remaining_calls = int(self.data.get("rate_limit", {}).get("remaining", 0))
         if remaining_calls is None or remaining_calls <= 0:
             # If rate limit info is unavailable, fall back to the static interval.
@@ -200,11 +220,10 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return
 
-        # Each refresh cycle costs 9 + len(zones) calls
-        # Also take 10% of the remaining calls as buffer
+        # As often as the remaining calls allow, but no more than once a minute.
         self._current_interval = max(
-            min_interval,
-            (self._time_until_reset * (9 + len(self.zones))) / (remaining_calls * 0.9),
+            MIN_UPDATE_INTERVAL.total_seconds(),
+            self._budgeted_interval(remaining_calls),
         )
 
         self._next_update = reset_time + timedelta(seconds=self._current_interval)
@@ -216,7 +235,33 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             remaining_calls,
         )
 
-    async def _async_update_devices(self) -> dict[str, dict]:
+    def _budgeted_interval(self, remaining_calls: int) -> float:
+        """Return the shortest interval the remaining calls allow until the reset.
+
+        A refresh costs one call for the zone states. The home data adds
+        HOME_DATA_CALLS once per HOME_DATA_INTERVAL, or on every refresh when
+        refreshes are further apart than that. The setup data adds a call per zone
+        and device, plus two, once per SETUP_DATA_INTERVAL. 10% of the remaining
+        calls are kept as a buffer.
+        """
+        budget = remaining_calls * 0.9 / self._time_until_reset
+        setup_rate = (2 + len(self.zones) + len(self.devices)) / (
+            SETUP_DATA_INTERVAL.total_seconds()
+        )
+        home_rate = HOME_DATA_CALLS / HOME_DATA_INTERVAL.total_seconds()
+
+        spare = budget - setup_rate - home_rate
+        interval = 1 / spare if spare > 0 else self._time_until_reset
+        if interval > HOME_DATA_INTERVAL.total_seconds():
+            spare = budget - setup_rate
+            interval = (
+                (1 + HOME_DATA_CALLS) / spare if spare > 0 else self._time_until_reset
+            )
+        return interval
+
+    async def _async_update_devices(
+        self, refresh_offsets: bool = False
+    ) -> dict[str, dict]:
         """Update the device data from Tado."""
 
         try:
@@ -227,10 +272,19 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not devices:
             raise UpdateFailed(f"No linked devices found for home ID {self.home_id}")
 
-        return await self.hass.async_add_executor_job(self._update_device_info, devices)
+        self.devices = devices
+        return await self.hass.async_add_executor_job(
+            self._update_device_info, devices, refresh_offsets
+        )
 
-    def _update_device_info(self, devices: list[dict[str, Any]]) -> dict[str, dict]:
-        """Update the device data from Tado."""
+    def _update_device_info(
+        self, devices: list[dict[str, Any]], refresh_offsets: bool = False
+    ) -> dict[str, dict]:
+        """Update the device data from Tado.
+
+        Temperature offsets are fetched for new devices and when refresh_offsets is
+        set; otherwise the cached offsets are reused.
+        """
         mapped_devices: dict[str, dict] = {}
         for device in devices:
             device_short_serial_no = device["shortSerialNo"]
@@ -240,13 +294,20 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     INSIDE_TEMPERATURE_MEASUREMENT
                     in device["characteristics"]["capabilities"]
                 ):
-                    _LOGGER.debug(
-                        "Updating temperature offset for device %s",
-                        device_short_serial_no,
-                    )
-                    device[TEMP_OFFSET] = self._tado.get_device_info(
-                        device_short_serial_no, TEMP_OFFSET
-                    )
+                    if (
+                        refresh_offsets
+                        or device_short_serial_no not in self._temp_offsets
+                    ):
+                        _LOGGER.debug(
+                            "Updating temperature offset for device %s",
+                            device_short_serial_no,
+                        )
+                        self._temp_offsets[device_short_serial_no] = (
+                            self._tado.get_device_info(
+                                device_short_serial_no, TEMP_OFFSET
+                            )
+                        )
+                    device[TEMP_OFFSET] = self._temp_offsets[device_short_serial_no]
             except RequestException as err:
                 _LOGGER.error(
                     "Error updating device %s: %s", device_short_serial_no, err
@@ -259,8 +320,15 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         return mapped_devices
 
-    async def _async_update_zones(self) -> dict[int, TadoZone]:
-        """Update the zone data from Tado."""
+    async def _async_update_zones(
+        self, refresh_defaults: bool = False
+    ) -> dict[int, TadoZone]:
+        """Update the zone data from Tado.
+
+        One call returns the state of every zone. Each zone's default overlay is
+        fetched for new zones and when refresh_defaults is set; otherwise the cached
+        one is reused.
+        """
 
         try:
             zone_states_call = await self.hass.async_add_executor_job(
@@ -273,21 +341,32 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         mapped_zones: dict[int, TadoZone] = {}
         for zone_id_str, raw_state in zone_states.items():
             zone_id = int(zone_id_str)
-            mapped_zones[zone_id] = await self._build_zone(zone_id, raw_state)
+            mapped_zones[zone_id] = await self._build_zone(
+                zone_id, raw_state, refresh_defaults
+            )
 
         return mapped_zones
 
-    async def _build_zone(self, zone_id: int, raw_state: dict[str, Any]) -> TadoZone:
-        """Fetch defaultOverlay for a zone and construct a TadoZone."""
+    async def _build_zone(
+        self, zone_id: int, raw_state: dict[str, Any], refresh_default: bool = False
+    ) -> TadoZone:
+        """Construct a TadoZone, fetching its defaultOverlay if needed."""
         _LOGGER.debug("Updating zone %s", zone_id)
-        try:
-            overlay_default = await self.hass.async_add_executor_job(
-                self._tado.get_zone_overlay_default, zone_id
-            )
-        except RequestException as err:
-            raise UpdateFailed(f"Error updating Tado zone {zone_id}: {err}") from err
+        if refresh_default or zone_id not in self._overlay_defaults:
+            try:
+                self._overlay_defaults[
+                    zone_id
+                ] = await self.hass.async_add_executor_job(
+                    self._tado.get_zone_overlay_default, zone_id
+                )
+            except RequestException as err:
+                raise UpdateFailed(
+                    f"Error updating Tado zone {zone_id}: {err}"
+                ) from err
 
-        data = TadoZone.from_data(zone_id, {**raw_state, **overlay_default})
+        data = TadoZone.from_data(
+            zone_id, {**raw_state, **self._overlay_defaults[zone_id]}
+        )
         _LOGGER.debug("Zone %s updated, with data: %s", zone_id, data)
         return data
 
@@ -367,6 +446,7 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self.hass.async_add_executor_job(self._tado.set_home)
         elif presence == PRESET_AUTO:
             await self.hass.async_add_executor_job(self._tado.set_auto)
+        self._invalidate_home_data()
 
     async def set_zone_overlay(
         self,
@@ -449,6 +529,8 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         except RequestException as err:
             raise UpdateFailed(f"Error setting Tado temperature offset: {err}") from err
+        self._temp_offsets.pop(device_id, None)
+        self._invalidate_home_data()
 
     async def set_meter_reading(self, reading: int) -> dict[str, Any]:
         """Send meter reading to Tado."""
@@ -473,6 +555,7 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         except RequestException as exc:
             raise HomeAssistantError(f"Error setting Tado child lock: {exc}") from exc
+        self._invalidate_home_data()
 
     async def _async_fetch_heating_circuits(self) -> None:
         """Fetch the heating circuits and their current per-zone assignment."""
