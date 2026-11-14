@@ -8,6 +8,7 @@ import requests_mock
 
 from homeassistant.components.tado.coordinator import (
     HOME_DATA_INTERVAL,
+    MIN_UPDATE_INTERVAL,
     SETUP_DATA_INTERVAL,
     TadoDataUpdateCoordinator,
 )
@@ -92,25 +93,27 @@ async def test_refresh_fetches_setup_data_after_its_interval(
 @pytest.mark.parametrize(
     ("remaining", "expected"),
     [
-        # Plenty of calls: the 5 or 30 minute floor applies.
-        (20000, None),
+        # Plenty of calls: the one-minute floor applies.
+        ("20000", MIN_UPDATE_INTERVAL),
         # Few calls left: refreshes are spread out until the reset.
-        (50, 3600),
+        ("50", None),
     ],
 )
-async def test_budgeted_interval(
+async def test_update_interval(
     hass: HomeAssistant,
     init_integration: requests_mock.Mocker,
-    remaining: int,
-    expected: int | None,
+    freezer: FrozenDateTimeFactory,
+    remaining: str,
+    expected: timedelta | None,
 ) -> None:
-    """The interval spreads the remaining calls over the time until the reset."""
+    """The interval spreads the remaining calls until the daily reset."""
+    freezer.move_to("2026-01-15 13:00:00+01:00")
     coordinator = _coordinator(hass)
-    coordinator._time_until_reset = 12 * 3600
+    coordinator.data["rate_limit"] = {"remaining": remaining}
 
-    interval = coordinator._budgeted_interval(remaining)
+    coordinator._calculate_update_interval()
 
-    if expected is None:
-        assert interval < 300
+    if expected is not None:
+        assert coordinator.update_interval == expected
     else:
-        assert interval > expected
+        assert coordinator.update_interval > timedelta(hours=1)

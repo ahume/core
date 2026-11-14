@@ -31,6 +31,8 @@ _LOGGER = logging.getLogger(__name__)
 
 MIN_TIME_BETWEEN_UPDATES = timedelta(minutes=4)
 SCAN_INTERVAL = timedelta(minutes=5)
+# The update interval is set by the remaining API calls, down to this floor.
+MIN_UPDATE_INTERVAL = timedelta(minutes=1)
 
 # Every refresh fetches the state of all zones in a single call. The rest of the
 # data changes far less often, so it is fetched on slower schedules of its own:
@@ -186,18 +188,6 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         """Fetch the home data on the next refresh, after it was changed."""
         self._home_data_updated = None
 
-    @property
-    def _is_any_zone_active(self) -> bool:
-        """Check if any zone is currently active (heating or AC running)."""
-        return any(
-            (
-                zone_data.heating_power_percentage is not None
-                and zone_data.heating_power_percentage > 0
-            )
-            or zone_data.ac_power == "ON"
-            for zone_data in self.data.get("zone", {}).values()
-        )
-
     def _calculate_update_interval(self) -> None:
         """Calculate an update interval based on remaining calls and estimates."""
 
@@ -217,12 +207,6 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         self._time_until_reset = (next_reset - reset_time).total_seconds()
 
-        # When any zone is actively heating, we use a shorter minimum
-        # To prevent overshooting in temperature,
-        # check if there's heating/cooling activity
-        # Accept five minutes to "overshoot", else reset back to 30 minutes
-        min_interval = 300 if self._is_any_zone_active else 1800
-
         remaining_calls = int(self.data.get("rate_limit", {}).get("remaining", 0))
         if remaining_calls is None or remaining_calls <= 0:
             # If rate limit info is unavailable, fall back to the static interval.
@@ -236,8 +220,10 @@ class TadoDataUpdateCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
             return
 
+        # As often as the remaining calls allow, but no more than once a minute.
         self._current_interval = max(
-            min_interval, self._budgeted_interval(remaining_calls)
+            MIN_UPDATE_INTERVAL.total_seconds(),
+            self._budgeted_interval(remaining_calls),
         )
 
         self._next_update = reset_time + timedelta(seconds=self._current_interval)
