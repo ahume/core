@@ -1,6 +1,6 @@
 """Fixtures for Tado tests."""
 
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from PyTado.http import DeviceActivationStatus
@@ -57,8 +57,8 @@ def mock_config_entry() -> MockConfigEntry:
 
 
 @pytest.fixture
-async def init_integration(hass: HomeAssistant):
-    """Set up the tado integration in Home Assistant."""
+async def init_integration(hass: HomeAssistant) -> AsyncGenerator[requests_mock.Mocker]:
+    """Set up the tado integration in Home Assistant, yielding the API mock."""
 
     token_fixture = "token.json"
     devices_fixture = "devices.json"
@@ -264,4 +264,4 @@ async def init_integration(hass: HomeAssistant):
         await entry.runtime_data.async_refresh()
         await hass.async_block_till_done()
 
-        yield
+        yield m
