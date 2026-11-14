@@ -1,6 +1,6 @@
 """Fixtures for Tado tests."""
 
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from freezegun.api import FrozenDateTimeFactory
@@ -62,8 +62,10 @@ def mock_config_entry() -> MockConfigEntry:
 
 
 @pytest.fixture
-async def init_integration(hass: HomeAssistant, freezer: FrozenDateTimeFactory):
-    """Set up the tado integration in Home Assistant."""
+async def init_integration(
+    hass: HomeAssistant, freezer: FrozenDateTimeFactory
+) -> AsyncGenerator[requests_mock.Mocker]:
+    """Set up the tado integration in Home Assistant, yielding the API mock."""
 
     token_fixture = "token.json"
     devices_fixture = "devices.json"
@@ -271,4 +273,4 @@ async def init_integration(hass: HomeAssistant, freezer: FrozenDateTimeFactory):
         async_fire_time_changed(hass)
         await hass.async_block_till_done(wait_background_tasks=True)
 
-        yield
+        yield m
